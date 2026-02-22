@@ -22,23 +22,27 @@
 <canvas id="c"></canvas>
 <script>
 // ── Constants ─────────────────────────────────────────────
-const W = 800, H = 600;
+const W = 800, H = 600, H_CANVAS = 710;   // extra 110px for bottom dpad
 const PW = 12, PH = 90, PSPEED = 6;
 const AI_SPEED = 4.2, AI_PRED = 0.55;
-const BSIZE = 12, BSINIT = 5, BSMAX = 12, BACC = 0.3;
+const BSIZE = 12, BSINIT = 3.5, BSMAX = 8, BACC = 0.2;  // slower
 const WIN_SCORE = 7, SHAKE_F = 6;
-const BTN_W = 68, BTN_H = 105;
-const BTN_X = W - 90, BTN_UP_Y = H/2 - BTN_H - 10, BTN_DN_Y = H/2 + 10;
+// Bottom dpad: left btn = UP, right btn = DOWN
+const DPAD_W = 150, DPAD_H = 76;
+const DPAD_GAP = 20;
+const DPAD_LX = W/2 - DPAD_W - DPAD_GAP/2;   // left button x
+const DPAD_RX = W/2 + DPAD_GAP/2;             // right button x
+const DPAD_Y  = H + 17;                        // top of buttons
 
 // ── Canvas setup & scaling ─────────────────────────────────
 const canvas = document.getElementById('c');
 const ctx    = canvas.getContext('2d');
 canvas.width  = W;
-canvas.height = H;
+canvas.height = H_CANVAS;
 function resize() {
-  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H_CANVAS);
   canvas.style.width  = (W * s) + 'px';
-  canvas.style.height = (H * s) + 'px';
+  canvas.style.height = (H_CANVAS * s) + 'px';
 }
 window.addEventListener('resize', resize);
 resize();
@@ -135,23 +139,23 @@ function canvasPoint(clientX, clientY) {
            y: (clientY - r.top)  * (H / r.height) };
 }
 function checkBtnTouch(px, py) {
-  if (px >= BTN_X && px <= BTN_X + BTN_W) {
-    if (py >= BTN_UP_Y && py <= BTN_UP_Y + BTN_H) touchUp   = true;
-    if (py >= BTN_DN_Y && py <= BTN_DN_Y + BTN_H) touchDown = true;
+  if (py >= DPAD_Y && py <= DPAD_Y + DPAD_H) {
+    if (px >= DPAD_LX && px <= DPAD_LX + DPAD_W) touchUp   = true;
+    if (px >= DPAD_RX && px <= DPAD_RX + DPAD_W) touchDown = true;
   }
 }
 
 canvas.addEventListener('mousedown', e => {
   const {x,y} = canvasPoint(e.clientX, e.clientY);
-  if (state === 'gameover') { doReplay(); return; }
+  if (state === 'gameover' && y < H) { doReplay(); return; }
   checkBtnTouch(x, y);
 });
 canvas.addEventListener('mouseup',   () => { touchUp = false; touchDown = false; });
 canvas.addEventListener('mousemove', e => {
   if (!e.buttons) return;
   const {x,y} = canvasPoint(e.clientX, e.clientY);
-  touchUp   = (x >= BTN_X && x <= BTN_X+BTN_W && y >= BTN_UP_Y && y <= BTN_UP_Y+BTN_H);
-  touchDown = (x >= BTN_X && x <= BTN_X+BTN_W && y >= BTN_DN_Y && y <= BTN_DN_Y+BTN_H);
+  touchUp = false; touchDown = false;
+  checkBtnTouch(x, y);
 });
 canvas.addEventListener('touchstart', e => {
   e.preventDefault();
@@ -303,30 +307,34 @@ function drawBall() {
   ctx.fillStyle = '#ffffff';
   ctx.beginPath(); ctx.arc(cx-2, cy-2, 2, 0, Math.PI*2); ctx.fill();
 }
-function drawButton(bx, by, active) {
-  ctx.globalAlpha = active ? 0.6 : 0.22;
+function drawDpadBtn(x, active, isUp) {
+  // Background
+  ctx.globalAlpha = active ? 0.55 : 0.18;
   ctx.fillStyle   = '#ffffff';
-  roundRect(bx, by, BTN_W, BTN_H, 12); ctx.fill();
-  ctx.globalAlpha = active ? 0.9 : 0.55;
-  ctx.strokeStyle = '#c8c8c8'; ctx.lineWidth = 2;
-  roundRect(bx, by, BTN_W, BTN_H, 12); ctx.stroke();
+  roundRect(x, DPAD_Y, DPAD_W, DPAD_H, 14); ctx.fill();
+  ctx.globalAlpha = active ? 0.85 : 0.4;
+  ctx.strokeStyle = '#cccccc'; ctx.lineWidth = 2;
+  roundRect(x, DPAD_Y, DPAD_W, DPAD_H, 14); ctx.stroke();
   ctx.globalAlpha = 1;
-}
-function drawArrow(bx, by, up, active) {
-  const cx = bx + BTN_W/2, cy = by + BTN_H/2;
-  const hw = 16, hh = 12;
-  ctx.fillStyle = active ? '#ffe632' : '#aaaaaa';
+  // Arrow
+  const cx = x + DPAD_W/2, cy = DPAD_Y + DPAD_H/2;
+  const hw = 20, hh = 14;
+  ctx.fillStyle = active ? '#ffe632' : '#999999';
   ctx.beginPath();
-  if (up) { ctx.moveTo(cx, cy-hh); ctx.lineTo(cx-hw, cy+hh); ctx.lineTo(cx+hw, cy+hh); }
-  else    { ctx.moveTo(cx, cy+hh); ctx.lineTo(cx-hw, cy-hh); ctx.lineTo(cx+hw, cy-hh); }
+  if (isUp) { ctx.moveTo(cx, cy-hh); ctx.lineTo(cx-hw, cy+hh); ctx.lineTo(cx+hw, cy+hh); }
+  else      { ctx.moveTo(cx, cy+hh); ctx.lineTo(cx-hw, cy-hh); ctx.lineTo(cx+hw, cy-hh); }
   ctx.closePath(); ctx.fill();
   if (active) { ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke(); }
 }
-function drawButtons() {
-  const up   = touchUp;
-  const down = touchDown;
-  drawButton(BTN_X, BTN_UP_Y, up);   drawArrow(BTN_X, BTN_UP_Y, true,  up);
-  drawButton(BTN_X, BTN_DN_Y, down); drawArrow(BTN_X, BTN_DN_Y, false, down);
+function drawDpad() {
+  // Button zone background
+  ctx.fillStyle = '#070707';
+  ctx.fillRect(0, H, W, H_CANVAS - H);
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(0, H, W, 2);
+  // Left = UP, Right = DOWN
+  drawDpadBtn(DPAD_LX, touchUp,   true);
+  drawDpadBtn(DPAD_RX, touchDown, false);
 }
 function text(str, x, y, font, color, align='left') {
   ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align;
@@ -350,7 +358,7 @@ function draw() {
   drawPaddle(you, '#ffe632');
   if (state === 'playing' || state === 'gameover') drawBall();
   particles.forEach(p => p.draw());
-  if (state === 'playing') drawButtons();
+  drawDpad();
 
   // Scores
   text(ai.score,  W/2-80, 76, 'bold 64px monospace', '#32dcdc', 'right');
