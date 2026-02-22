@@ -128,15 +128,15 @@ let touchUp = false, touchDown = false;
 
 document.addEventListener('keydown', e => {
   keys[e.key] = true;
-  if (e.key === 'Escape') { /* no-op in browser */ }
+  if (e.key === 'Escape') { window.location.reload(); }
   if (state === 'gameover' && e.key === ' ') doReplay();
 });
 document.addEventListener('keyup',  e => { keys[e.key] = false; });
 
 function canvasPoint(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
-  return { x: (clientX - r.left) * (W / r.width),
-           y: (clientY - r.top)  * (H / r.height) };
+  return { x: (clientX - r.left) * (W        / r.width),
+           y: (clientY - r.top)  * (H_CANVAS / r.height) };
 }
 function checkBtnTouch(px, py) {
   if (py >= DPAD_Y && py <= DPAD_Y + DPAD_H) {
