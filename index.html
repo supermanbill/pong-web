@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Pong</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      overflow: hidden;
+      touch-action: none;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ── Constants ─────────────────────────────────────────────
+const W = 800, H = 600;
+const PW = 12, PH = 90, PSPEED = 6;
+const AI_SPEED = 4.2, AI_PRED = 0.55;
+const BSIZE = 12, BSINIT = 5, BSMAX = 12, BACC = 0.3;
+const WIN_SCORE = 7, SHAKE_F = 6;
+const BTN_W = 68, BTN_H = 105;
+const BTN_X = W - 90, BTN_UP_Y = H/2 - BTN_H - 10, BTN_DN_Y = H/2 + 10;
+
+// ── Canvas setup & scaling ─────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+canvas.width  = W;
+canvas.height = H;
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width  = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Audio (Web Audio API) ─────────────────────────────────
+let audio = null;
+function getAudio() {
+  if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+  return audio;
+}
+function tone(freq, dur, vol = 0.4, type = 'sine') {
+  try {
+    const ac  = getAudio();
+    const osc = ac.createOscillator();
+    const g   = ac.createGain();
+    osc.connect(g); g.connect(ac.destination);
+    osc.type = type;
+    osc.frequency.value = freq;
+    g.gain.setValueAtTime(vol, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + dur);
+    osc.start(ac.currentTime);
+    osc.stop(ac.currentTime + dur);
+  } catch(e) {}
+}
+function playTick()  { tone(350, 0.09, 0.3, 'square'); }
+function playGo()    {
+  tone(523, 0.06, 0.5); setTimeout(() => tone(659, 0.06, 0.5), 60);
+  setTimeout(() => tone(784, 0.22, 0.5), 120);
+}
+function playHit(speed) {
+  const vol = 0.2 + (speed / BSMAX) * 0.35;
+  tone(400 + speed * 30, 0.07, vol, 'sine');
+}
+function playWin()  {
+  [523,659,784,1047].forEach((f,i) => setTimeout(() => tone(f, i===3?0.5:0.1, 0.55), i*100));
+}
+function playLose() {
+  [440,392,349,262].forEach((f,i) => setTimeout(() => tone(f, i===3?0.6:0.14, 0.4), i*140));
+}
+
+// ── Particles ─────────────────────────────────────────────
+const SPARKS = [[255,255,200],[255,240,80],[255,180,30],[255,120,20],[255,255,255]];
+class Particle {
+  constructor(x, y, dir) {
+    const ang = (Math.random() - 0.5) * Math.PI * 1.1;
+    const spd = 2.5 + Math.random() * 5.5;
+    this.x = x; this.y = y;
+    this.vx = Math.cos(ang) * spd * dir;
+    this.vy = Math.sin(ang) * spd;
+    this.life  = 1;
+    this.decay = 0.035 + Math.random() * 0.04;
+    this.col   = SPARKS[Math.floor(Math.random() * SPARKS.length)];
+    this.size  = 2 + Math.floor(Math.random() * 4);
+  }
+  update() {
+    this.x += this.vx; this.y += this.vy;
+    this.vy += 0.25; this.vx *= 0.96;
+    this.life -= this.decay;
+  }
+  draw() {
+    if (this.life <= 0) return;
+    const sz = Math.max(1, this.size * this.life);
+    const [r,g,b] = this.col;
+    ctx.fillStyle = `rgba(${~~(r*this.life)},${~~(g*this.life)},${~~(b*this.life)},${this.life})`;
+    ctx.beginPath(); ctx.arc(this.x, this.y, sz, 0, Math.PI*2); ctx.fill();
+  }
+  get alive() { return this.life > 0; }
+}
+
+// ── Game state ─────────────────────────────────────────────
+let state = 'countdown';  // countdown | start_flash | playing | gameover
+let cdVal = 5, cdTick = 1.0, flashTimer = 0;
+let shake = 0, winnerText = '', resultPlayed = false;
+let particles = [];
+
+const ai  = { x: 20,              y: H/2 - PH/2, score: 0 };
+const you = { x: W - 20 - PW,     y: H/2 - PH/2, score: 0 };
+const ball = { x: W/2, y: H/2, vx: BSINIT, vy: BSINIT, spd: BSINIT };
+
+// ── Input ─────────────────────────────────────────────────
+const keys = {};
+let touchUp = false, touchDown = false;
+
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (e.key === 'Escape') { /* no-op in browser */ }
+  if (state === 'gameover' && e.key === ' ') doReplay();
+});
+document.addEventListener('keyup',  e => { keys[e.key] = false; });
+
+function canvasPoint(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (clientX - r.left) * (W / r.width),
+           y: (clientY - r.top)  * (H / r.height) };
+}
+function checkBtnTouch(px, py) {
+  if (px >= BTN_X && px <= BTN_X + BTN_W) {
+    if (py >= BTN_UP_Y && py <= BTN_UP_Y + BTN_H) touchUp   = true;
+    if (py >= BTN_DN_Y && py <= BTN_DN_Y + BTN_H) touchDown = true;
+  }
+}
+
+canvas.addEventListener('mousedown', e => {
+  const {x,y} = canvasPoint(e.clientX, e.clientY);
+  if (state === 'gameover') { doReplay(); return; }
+  checkBtnTouch(x, y);
+});
+canvas.addEventListener('mouseup',   () => { touchUp = false; touchDown = false; });
+canvas.addEventListener('mousemove', e => {
+  if (!e.buttons) return;
+  const {x,y} = canvasPoint(e.clientX, e.clientY);
+  touchUp   = (x >= BTN_X && x <= BTN_X+BTN_W && y >= BTN_UP_Y && y <= BTN_UP_Y+BTN_H);
+  touchDown = (x >= BTN_X && x <= BTN_X+BTN_W && y >= BTN_DN_Y && y <= BTN_DN_Y+BTN_H);
+});
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (state === 'gameover') { doReplay(); return; }
+  touchUp = false; touchDown = false;
+  Array.from(e.touches).forEach(t => {
+    const {x,y} = canvasPoint(t.clientX, t.clientY);
+    checkBtnTouch(x, y);
+  });
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  touchUp = false; touchDown = false;
+  Array.from(e.touches).forEach(t => {
+    const {x,y} = canvasPoint(t.clientX, t.clientY);
+    checkBtnTouch(x, y);
+  });
+}, { passive: false });
+canvas.addEventListener('touchend',  e => {
+  e.preventDefault();
+  touchUp = false; touchDown = false;
+}, { passive: false });
+
+// ── Reset ─────────────────────────────────────────────────
+function resetBall(dir = 1) {
+  ball.x = W/2; ball.y = H/2;
+  ball.spd = BSINIT;
+  ball.vx = BSINIT * dir;
+  ball.vy = BSINIT * (dir > 0 ? 1 : -1);
+}
+function doReplay() {
+  ai.score = 0; you.score = 0;
+  resetBall(1);
+  particles = [];
+  state = 'countdown'; cdVal = 5; cdTick = 1.0; flashTimer = 0;
+  shake = 0; winnerText = ''; resultPlayed = false;
+  playTick();
+}
+
+// ── Update ────────────────────────────────────────────────
+function update(dt) {
+  if (state === 'countdown') {
+    cdTick -= dt;
+    if (cdTick <= 0) {
+      cdVal--; cdTick = 1.0;
+      if (cdVal >= 0) playTick();
+      if (cdVal < 0) { state = 'start_flash'; flashTimer = 0.75; playGo(); }
+    }
+  } else if (state === 'start_flash') {
+    flashTimer -= dt;
+    if (flashTimer <= 0) state = 'playing';
+  } else if (state === 'playing') {
+    // AI move
+    if (ball.vx < 0) {
+      const t = (ai.x + PW/2 - ball.x) / ball.vx;
+      let py = ball.y + ball.vy * t * AI_PRED;
+      py = Math.max(0, Math.min(H, py));
+      const target = ball.y + (py - ball.y) * AI_PRED;
+      const diff   = target - (ai.y + PH/2);
+      ai.y += Math.min(Math.abs(diff), AI_SPEED) * Math.sign(diff);
+    } else {
+      const diff = H/2 - (ai.y + PH/2);
+      ai.y += Math.min(Math.abs(diff), AI_SPEED) * Math.sign(diff);
+    }
+    ai.y = Math.max(0, Math.min(H - PH, ai.y));
+
+    // Player move
+    if (keys['ArrowUp']   || touchUp)   you.y -= PSPEED;
+    if (keys['ArrowDown'] || touchDown) you.y += PSPEED;
+    you.y = Math.max(0, Math.min(H - PH, you.y));
+
+    // Ball
+    ball.x += ball.vx; ball.y += ball.vy;
+    if (ball.y - BSIZE/2 <= 0)  { ball.y = BSIZE/2; ball.vy =  Math.abs(ball.vy); }
+    if (ball.y + BSIZE/2 >= H)  { ball.y = H - BSIZE/2; ball.vy = -Math.abs(ball.vy); }
+
+    // Collision helpers
+    function ballRect() {
+      return { l: ball.x-BSIZE/2, r: ball.x+BSIZE/2, t: ball.y-BSIZE/2, b: ball.y+BSIZE/2 };
+    }
+    function paddleRect(p) { return { l: p.x, r: p.x+PW, t: p.y, b: p.y+PH }; }
+    function overlap(a, b) { return a.l<b.r && a.r>b.l && a.t<b.b && a.b>b.t; }
+    function hitPaddle(p) {
+      const rel = Math.max(-1, Math.min(1, (ball.y - (p.y+PH/2)) / (PH/2)));
+      ball.spd = Math.min(ball.spd + BACC, BSMAX);
+      ball.vx  = ball.spd * (ball.vx > 0 ? -1 : 1);
+      ball.vy  = ball.spd * rel;
+    }
+    const br = ballRect();
+    if (overlap(br, paddleRect(ai)) && ball.vx < 0) {
+      ball.x = ai.x + PW + BSIZE/2;
+      hitPaddle(ai); shake = SHAKE_F; playHit(ball.spd);
+      for (let i=0; i<14; i++) particles.push(new Particle(ball.x, ball.y,  1));
+    }
+    if (overlap(br, paddleRect(you)) && ball.vx > 0) {
+      ball.x = you.x - BSIZE/2;
+      hitPaddle(you); shake = SHAKE_F; playHit(ball.spd);
+      for (let i=0; i<14; i++) particles.push(new Particle(ball.x, ball.y, -1));
+    }
+
+    // Score
+    if (ball.x < 0)  { you.score++; particles=[]; resetBall( 1); }
+    if (ball.x > W)  { ai.score++;  particles=[]; resetBall(-1); }
+
+    // Win
+    if (ai.score >= WIN_SCORE && !resultPlayed) {
+      winnerText = 'AI WINS!'; state = 'gameover'; resultPlayed = true; playLose();
+    }
+    if (you.score >= WIN_SCORE && !resultPlayed) {
+      winnerText = 'YOU WIN!'; state = 'gameover'; resultPlayed = true; playWin();
+    }
+
+    particles.forEach(p => p.update());
+    particles = particles.filter(p => p.alive);
+  }
+}
+
+// ── Draw ──────────────────────────────────────────────────
+function drawCenterLine() {
+  ctx.fillStyle = '#3c3c3c';
+  const dashH = 16, gap = 10;
+  for (let y = 0; y < H; y += dashH + gap)
+    ctx.fillRect(W/2 - 1, y, 2, dashH);
+}
+function drawPaddle(p, color) {
+  ctx.fillStyle = color;
+  roundRect(p.x, p.y, PW, PH, 4);
+  ctx.fill();
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y);
+  ctx.arcTo(x+w, y, x+w, y+r, r); ctx.lineTo(x+w, y+h-r);
+  ctx.arcTo(x+w, y+h, x+w-r, y+h, r); ctx.lineTo(x+r, y+h);
+  ctx.arcTo(x, y+h, x, y+h-r, r); ctx.lineTo(x, y+r);
+  ctx.arcTo(x, y, x+r, y, r); ctx.closePath();
+}
+function drawBall() {
+  const r = BSIZE/2, cx = ball.x, cy = ball.y;
+  // Glow layers
+  [[r+8,0.10],[r+4,0.22],[r+1,0.50]].forEach(([rad, a]) => {
+    ctx.globalAlpha = a;
+    ctx.fillStyle = '#ffff00';
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI*2); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#ffff00';
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(cx-2, cy-2, 2, 0, Math.PI*2); ctx.fill();
+}
+function drawButton(bx, by, active) {
+  ctx.globalAlpha = active ? 0.6 : 0.22;
+  ctx.fillStyle   = '#ffffff';
+  roundRect(bx, by, BTN_W, BTN_H, 12); ctx.fill();
+  ctx.globalAlpha = active ? 0.9 : 0.55;
+  ctx.strokeStyle = '#c8c8c8'; ctx.lineWidth = 2;
+  roundRect(bx, by, BTN_W, BTN_H, 12); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+function drawArrow(bx, by, up, active) {
+  const cx = bx + BTN_W/2, cy = by + BTN_H/2;
+  const hw = 16, hh = 12;
+  ctx.fillStyle = active ? '#ffe632' : '#aaaaaa';
+  ctx.beginPath();
+  if (up) { ctx.moveTo(cx, cy-hh); ctx.lineTo(cx-hw, cy+hh); ctx.lineTo(cx+hw, cy+hh); }
+  else    { ctx.moveTo(cx, cy+hh); ctx.lineTo(cx-hw, cy-hh); ctx.lineTo(cx+hw, cy-hh); }
+  ctx.closePath(); ctx.fill();
+  if (active) { ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke(); }
+}
+function drawButtons() {
+  const up   = touchUp;
+  const down = touchDown;
+  drawButton(BTN_X, BTN_UP_Y, up);   drawArrow(BTN_X, BTN_UP_Y, true,  up);
+  drawButton(BTN_X, BTN_DN_Y, down); drawArrow(BTN_X, BTN_DN_Y, false, down);
+}
+function text(str, x, y, font, color, align='left') {
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align;
+  ctx.fillText(str, x, y);
+}
+function overlay(alpha) {
+  ctx.fillStyle = `rgba(0,0,0,${alpha})`; ctx.fillRect(0,0,W,H);
+}
+
+function draw() {
+  // Shake offset
+  let ox = 0, oy = 0;
+  if (shake > 0) { ox = (Math.random()-0.5)*8; oy = (Math.random()-0.5)*8; shake--; }
+
+  ctx.save();
+  ctx.translate(ox, oy);
+
+  ctx.fillStyle = '#000'; ctx.fillRect(-10,-10,W+20,H+20);
+  drawCenterLine();
+  drawPaddle(ai,  '#32dcdc');
+  drawPaddle(you, '#ffe632');
+  if (state === 'playing' || state === 'gameover') drawBall();
+  particles.forEach(p => p.draw());
+  if (state === 'playing') drawButtons();
+
+  // Scores
+  text(ai.score,  W/2-80, 76, 'bold 64px monospace', '#32dcdc', 'right');
+  text(you.score, W/2+80, 76, 'bold 64px monospace', '#ffe632', 'left');
+  // Name labels
+  text('AI',  W/2-80, 106, '22px monospace', '#32dcdc', 'right');
+  text('You', W/2+80, 106, '22px monospace', '#ffe632', 'left');
+
+  // Countdown
+  if (state === 'countdown') {
+    overlay(0.43);
+    const pulse = Math.min(1, cdTick / 0.25);
+    const scale = 1 + 0.25 * pulse;
+    ctx.save();
+    ctx.translate(W/2, H/2);
+    ctx.scale(scale, scale);
+    text(Math.max(0, cdVal), 0, 55, 'bold 130px monospace', '#ffffff', 'center');
+    ctx.restore();
+  }
+  // Start flash
+  else if (state === 'start_flash') {
+    overlay(0.35);
+    text('Start!', W/2, H/2+50, 'bold 120px monospace', '#50ff82', 'center');
+  }
+  // Game over
+  else if (state === 'gameover') {
+    overlay(0.67);
+    text('GAME OVER',        W/2, H/2-60,  'bold 62px monospace', '#ffffff',  'center');
+    const wc = winnerText === 'YOU WIN!' ? '#50ff82' : '#ff5050';
+    text(winnerText,         W/2, H/2+0,   'bold 34px monospace', wc,         'center');
+    text('REPLAY  /  SPACE', W/2, H/2+50,  'bold 28px monospace', '#ffe632',  'center');
+    text('EXIT GAME  /  ESC',W/2, H/2+92,  '22px monospace',      '#3c3c3c',  'center');
+    text('( tap anywhere to replay )', W/2, H/2+124, '19px monospace', '#3c3c3c', 'center');
+  }
+
+  ctx.restore();
+}
+
+// ── Game loop ─────────────────────────────────────────────
+let last = 0;
+function loop(ts) {
+  const dt = Math.min((ts - last) / 1000, 0.05);
+  last = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// Start with first tick, then launch loop
+playTick();
+requestAnimationFrame(ts => { last = ts; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>
