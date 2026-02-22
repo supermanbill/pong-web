@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Pong</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      overflow: hidden;
+      touch-action: none;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ── Constants ─────────────────────────────────────────────
+const W = 800, H = 600, H_CANVAS = 710;   // extra 110px for bottom dpad
+const PW = 12, PH = 90, PSPEED = 6;
+const AI_SPEED = 4.2, AI_PRED = 0.55;
+const BSIZE = 12, BSINIT = 3.5, BSMAX = 8, BACC = 0.2;  // slower
+const WIN_SCORE = 7, SHAKE_F = 6;
+// Bottom dpad: left btn = UP, right btn = DOWN
+const DPAD_W = 150, DPAD_H = 76;
+const DPAD_GAP = 20;
+const DPAD_LX = W/2 - DPAD_W - DPAD_GAP/2;   // left button x
+const DPAD_RX = W/2 + DPAD_GAP/2;             // right button x
+const DPAD_Y  = H + 17;                        // top of buttons
+
+// ── Canvas setup & scaling ─────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+canvas.width  = W;
+canvas.height = H_CANVAS;
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H_CANVAS);
+  canvas.style.width  = (W * s) + 'px';
+  canvas.style.height = (H_CANVAS * s) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Audio (Web Audio API) ─────────────────────────────────
+let audio = null;
+function getAudio() {
+  if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+  return audio;
+}
+function tone(freq, dur, vol = 0.4, type = 'sine') {
+  try {
+    const ac  = getAudio();
+    const osc = ac.createOscillator();
+    const g   = ac.createGain();
+    osc.connect(g); g.connect(ac.destination);
+    osc.type = type;
+    osc.frequency.value = freq;
+    g.gain.setValueAtTime(vol, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + dur);
+    osc.start(ac.currentTime);
+    osc.stop(ac.currentTime + dur);
+  } catch(e) {}
+}
+function playTick()  { tone(350, 0.09, 0.3, 'square'); }
+function playGo()    {
+  tone(523, 0.06, 0.5); setTimeout(() => tone(659, 0.06, 0.5), 60);
+  setTimeout(() => tone(784, 0.22, 0.5), 120);
+}
+function playHit(speed) {
+  const vol = 0.2 + (speed / BSMAX) * 0.35;
+  tone(400 + speed * 30, 0.07, vol, 'sine');
+}
+function playWin()  {
+  [523,659,784,1047].forEach((f,i) => setTimeout(() => tone(f, i===3?0.5:0.1, 0.55), i*100));
+}
+function playLose() {
+  [440,392,349,262].forEach((f,i) => setTimeout(() => tone(f, i===3?0.6:0.14, 0.4), i*140));
+}
+
+// ── Particles ─────────────────────────────────────────────
+const SPARKS = [[255,255,200],[255,240,80],[255,180,30],[255,120,20],[255,255,255]];
+class Particle {
+  constructor(x, y, dir) {
+    const ang = (Math.random() - 0.5) * Math.PI * 1.1;
+    const spd = 2.5 + Math.random() * 5.5;
+    this.x = x; this.y = y;
+    this.vx = Math.cos(ang) * spd * dir;
+    this.vy = Math.sin(ang) * spd;
+    this.life  = 1;
+    this.decay = 0.035 + Math.random() * 0.04;
+    this.col   = SPARKS[Math.floor(Math.random() * SPARKS.length)];
+    this.size  = 2 + Math.floor(Math.random() * 4);
+  }
+  update() {
+    this.x += this.vx; this.y += this.vy;
+    this.vy += 0.25; this.vx *= 0.96;
+    this.life -= this.decay;
+  }
+  draw() {
+    if (this.life <= 0) return;
+    const sz = Math.max(1, this.size * this.life);
+    const [r,g,b] = this.col;
+    ctx.fillStyle = `rgba(${~~(r*this.life)},${~~(g*this.life)},${~~(b*this.life)},${this.life})`;
+    ctx.beginPath(); ctx.arc(this.x, this.y, sz, 0, Math.PI*2); ctx.fill();
+  }
+  get alive() { return this.life > 0; }
+}
+
+// ── Game state ─────────────────────────────────────────────
+let state = 'countdown';  // countdown | start_flash | playing | gameover
+let cdVal = 5, cdTick = 1.0, flashTimer = 0;
+let shake = 0, winnerText = '', resultPlayed = false;
+let particles = [];
+let wallFlashTop = 0, wallFlashBot = 0;  // 0-1 flash intensity
+
+const ai  = { x: 20,              y: H/2 - PH/2, score: 0 };
+const you = { x: W - 20 - PW,     y: H/2 - PH/2, score: 0 };
+const ball = { x: W/2, y: H/2, vx: BSINIT, vy: BSINIT, spd: BSINIT };
+
+// ── Input ─────────────────────────────────────────────────
+const keys = {};
+let touchUp = false, touchDown = false;
+
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (e.key === 'Escape') { window.location.reload(); }
+  if (state === 'gameover' && e.key === ' ') doReplay();
+});
+document.addEventListener('keyup',  e => { keys[e.key] = false; });
+
+function canvasPoint(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (clientX - r.left) * (W        / r.width),
+           y: (clientY - r.top)  * (H_CANVAS / r.height) };
+}
+function checkBtnTouch(px, py) {
+  if (py >= DPAD_Y && py <= DPAD_Y + DPAD_H) {
+    if (px >= DPAD_LX && px <= DPAD_LX + DPAD_W) touchUp   = true;
+    if (px >= DPAD_RX && px <= DPAD_RX + DPAD_W) touchDown = true;
+  }
+}
+
+canvas.addEventListener('mousedown', e => {
+  const {x,y} = canvasPoint(e.clientX, e.clientY);
+  if (state === 'gameover' && y < H) { doReplay(); return; }
+  checkBtnTouch(x, y);
+});
+canvas.addEventListener('mouseup',   () => { touchUp = false; touchDown = false; });
+canvas.addEventListener('mousemove', e => {
+  if (!e.buttons) return;
+  const {x,y} = canvasPoint(e.clientX, e.clientY);
+  touchUp = false; touchDown = false;
+  checkBtnTouch(x, y);
+});
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (state === 'gameover') { doReplay(); return; }
+  touchUp = false; touchDown = false;
+  Array.from(e.touches).forEach(t => {
+    const {x,y} = canvasPoint(t.clientX, t.clientY);
+    checkBtnTouch(x, y);
+  });
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  touchUp = false; touchDown = false;
+  Array.from(e.touches).forEach(t => {
+    const {x,y} = canvasPoint(t.clientX, t.clientY);
+    checkBtnTouch(x, y);
+  });
+}, { passive: false });
+canvas.addEventListener('touchend',  e => {
+  e.preventDefault();
+  touchUp = false; touchDown = false;
+}, { passive: false });
+
+// ── Reset ─────────────────────────────────────────────────
+function resetBall(dir = 1) {
+  ball.x = W/2; ball.y = H/2;
+  ball.spd = BSINIT;
+  ball.vx = BSINIT * dir;
+  ball.vy = BSINIT * (dir > 0 ? 1 : -1);
+}
+function doReplay() {
+  ai.score = 0; you.score = 0;
+  resetBall(1);
+  particles = [];
+  state = 'countdown'; cdVal = 5; cdTick = 1.0; flashTimer = 0;
+  shake = 0; winnerText = ''; resultPlayed = false;
+  wallFlashTop = 0; wallFlashBot = 0;
+  playTick();
+}
+
+// ── Update ────────────────────────────────────────────────
+function update(dt) {
+  if (state === 'countdown') {
+    cdTick -= dt;
+    if (cdTick <= 0) {
+      cdVal--; cdTick = 1.0;
+      if (cdVal >= 0) playTick();
+      if (cdVal < 0) { state = 'start_flash'; flashTimer = 0.75; playGo(); }
+    }
+  } else if (state === 'start_flash') {
+    flashTimer -= dt;
+    if (flashTimer <= 0) state = 'playing';
+  } else if (state === 'playing') {
+    // AI move
+    if (ball.vx < 0) {
+      const t = (ai.x + PW/2 - ball.x) / ball.vx;
+      let py = ball.y + ball.vy * t * AI_PRED;
+      py = Math.max(0, Math.min(H, py));
+      const target = ball.y + (py - ball.y) * AI_PRED;
+      const diff   = target - (ai.y + PH/2);
+      ai.y += Math.min(Math.abs(diff), AI_SPEED) * Math.sign(diff);
+    } else {
+      const diff = H/2 - (ai.y + PH/2);
+      ai.y += Math.min(Math.abs(diff), AI_SPEED) * Math.sign(diff);
+    }
+    ai.y = Math.max(0, Math.min(H - PH, ai.y));
+
+    // Player move
+    if (keys['ArrowUp']   || touchUp)   you.y -= PSPEED;
+    if (keys['ArrowDown'] || touchDown) you.y += PSPEED;
+    you.y = Math.max(0, Math.min(H - PH, you.y));
+
+    // Ball
+    ball.x += ball.vx; ball.y += ball.vy;
+    if (ball.y - BSIZE/2 <= 0) { ball.y = BSIZE/2; ball.vy =  Math.abs(ball.vy); wallFlashTop = 1.0; }
+    if (ball.y + BSIZE/2 >= H) { ball.y = H-BSIZE/2; ball.vy = -Math.abs(ball.vy); wallFlashBot = 1.0; }
+    wallFlashTop = Math.max(0, wallFlashTop - dt * 4);
+    wallFlashBot = Math.max(0, wallFlashBot - dt * 4);
+
+    // Collision helpers
+    function ballRect() {
+      return { l: ball.x-BSIZE/2, r: ball.x+BSIZE/2, t: ball.y-BSIZE/2, b: ball.y+BSIZE/2 };
+    }
+    function paddleRect(p) { return { l: p.x, r: p.x+PW, t: p.y, b: p.y+PH }; }
+    function overlap(a, b) { return a.l<b.r && a.r>b.l && a.t<b.b && a.b>b.t; }
+    function hitPaddle(p) {
+      const rel = Math.max(-1, Math.min(1, (ball.y - (p.y+PH/2)) / (PH/2)));
+      ball.spd = Math.min(ball.spd + BACC, BSMAX);
+      ball.vx  = ball.spd * (ball.vx > 0 ? -1 : 1);
+      ball.vy  = ball.spd * rel;
+    }
+    const br = ballRect();
+    if (overlap(br, paddleRect(ai)) && ball.vx < 0) {
+      ball.x = ai.x + PW + BSIZE/2;
+      hitPaddle(ai); shake = SHAKE_F; playHit(ball.spd);
+      for (let i=0; i<14; i++) particles.push(new Particle(ball.x, ball.y,  1));
+    }
+    if (overlap(br, paddleRect(you)) && ball.vx > 0) {
+      ball.x = you.x - BSIZE/2;
+      hitPaddle(you); shake = SHAKE_F; playHit(ball.spd);
+      for (let i=0; i<14; i++) particles.push(new Particle(ball.x, ball.y, -1));
+    }
+
+    // Score
+    if (ball.x < 0)  { you.score++; particles=[]; resetBall( 1); }
+    if (ball.x > W)  { ai.score++;  particles=[]; resetBall(-1); }
+
+    // Win
+    if (ai.score >= WIN_SCORE && !resultPlayed) {
+      winnerText = 'AI WINS!'; state = 'gameover'; resultPlayed = true; playLose();
+    }
+    if (you.score >= WIN_SCORE && !resultPlayed) {
+      winnerText = 'YOU WIN!'; state = 'gameover'; resultPlayed = true; playWin();
+    }
+
+    particles.forEach(p => p.update());
+    particles = particles.filter(p => p.alive);
+  }
+}
+
+// ── Draw ──────────────────────────────────────────────────
+function drawWalls() {
+  const WH = 6;  // wall bar thickness
+  // Top wall
+  const tf = wallFlashTop;
+  ctx.fillStyle = tf > 0.05
+    ? `rgba(255,255,${~~(80+175*tf)},${0.5+tf*0.5})`
+    : 'rgba(200,200,200,0.35)';
+  ctx.fillRect(0, 0, W, WH);
+  if (tf > 0.05) {                        // glow halo
+    ctx.globalAlpha = tf * 0.3;
+    ctx.fillStyle = '#ffff88';
+    ctx.fillRect(0, 0, W, WH + 14);
+    ctx.globalAlpha = 1;
+  }
+  // Bottom wall
+  const bf = wallFlashBot;
+  ctx.fillStyle = bf > 0.05
+    ? `rgba(255,255,${~~(80+175*bf)},${0.5+bf*0.5})`
+    : 'rgba(200,200,200,0.35)';
+  ctx.fillRect(0, H - WH, W, WH);
+  if (bf > 0.05) {                        // glow halo
+    ctx.globalAlpha = bf * 0.3;
+    ctx.fillStyle = '#ffff88';
+    ctx.fillRect(0, H - WH - 14, W, WH + 14);
+    ctx.globalAlpha = 1;
+  }
+}
+function drawCenterLine() {
+  ctx.fillStyle = '#3c3c3c';
+  const dashH = 16, gap = 10;
+  for (let y = 0; y < H; y += dashH + gap)
+    ctx.fillRect(W/2 - 1, y, 2, dashH);
+}
+function drawPaddle(p, color) {
+  ctx.fillStyle = color;
+  roundRect(p.x, p.y, PW, PH, 4);
+  ctx.fill();
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y);
+  ctx.arcTo(x+w, y, x+w, y+r, r); ctx.lineTo(x+w, y+h-r);
+  ctx.arcTo(x+w, y+h, x+w-r, y+h, r); ctx.lineTo(x+r, y+h);
+  ctx.arcTo(x, y+h, x, y+h-r, r); ctx.lineTo(x, y+r);
+  ctx.arcTo(x, y, x+r, y, r); ctx.closePath();
+}
+function drawBall() {
+  const r = BSIZE/2, cx = ball.x, cy = ball.y;
+  // Glow layers
+  [[r+8,0.10],[r+4,0.22],[r+1,0.50]].forEach(([rad, a]) => {
+    ctx.globalAlpha = a;
+    ctx.fillStyle = '#ffff00';
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI*2); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#ffff00';
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(cx-2, cy-2, 2, 0, Math.PI*2); ctx.fill();
+}
+function drawDpadBtn(x, active, isUp) {
+  // Background
+  ctx.globalAlpha = active ? 0.55 : 0.18;
+  ctx.fillStyle   = '#ffffff';
+  roundRect(x, DPAD_Y, DPAD_W, DPAD_H, 14); ctx.fill();
+  ctx.globalAlpha = active ? 0.85 : 0.4;
+  ctx.strokeStyle = '#cccccc'; ctx.lineWidth = 2;
+  roundRect(x, DPAD_Y, DPAD_W, DPAD_H, 14); ctx.stroke();
+  ctx.globalAlpha = 1;
+  // Arrow
+  const cx = x + DPAD_W/2, cy = DPAD_Y + DPAD_H/2;
+  const hw = 20, hh = 14;
+  ctx.fillStyle = active ? '#ffe632' : '#999999';
+  ctx.beginPath();
+  if (isUp) { ctx.moveTo(cx, cy-hh); ctx.lineTo(cx-hw, cy+hh); ctx.lineTo(cx+hw, cy+hh); }
+  else      { ctx.moveTo(cx, cy+hh); ctx.lineTo(cx-hw, cy-hh); ctx.lineTo(cx+hw, cy-hh); }
+  ctx.closePath(); ctx.fill();
+  if (active) { ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke(); }
+}
+function drawDpad() {
+  // Button zone background
+  ctx.fillStyle = '#070707';
+  ctx.fillRect(0, H, W, H_CANVAS - H);
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(0, H, W, 2);
+  // Left = UP, Right = DOWN
+  drawDpadBtn(DPAD_LX, touchUp,   true);
+  drawDpadBtn(DPAD_RX, touchDown, false);
+}
+function text(str, x, y, font, color, align='left') {
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align;
+  ctx.fillText(str, x, y);
+}
+function overlay(alpha) {
+  ctx.fillStyle = `rgba(0,0,0,${alpha})`; ctx.fillRect(0,0,W,H);
+}
+
+function draw() {
+  // Shake offset
+  let ox = 0, oy = 0;
+  if (shake > 0) { ox = (Math.random()-0.5)*8; oy = (Math.random()-0.5)*8; shake--; }
+
+  ctx.save();
+  ctx.translate(ox, oy);
+
+  ctx.fillStyle = '#000'; ctx.fillRect(-10,-10,W+20,H+20);
+  drawCenterLine();
+  drawWalls();
+  drawPaddle(ai,  '#32dcdc');
+  drawPaddle(you, '#ffe632');
+  if (state === 'playing' || state === 'gameover') drawBall();
+  particles.forEach(p => p.draw());
+  drawDpad();
+
+  // Scores
+  text(ai.score,  W/2-80, 76, 'bold 64px monospace', '#32dcdc', 'right');
+  text(you.score, W/2+80, 76, 'bold 64px monospace', '#ffe632', 'left');
+  // Name labels
+  text('AI',  W/2-80, 106, '22px monospace', '#32dcdc', 'right');
+  text('You', W/2+80, 106, '22px monospace', '#ffe632', 'left');
+
+  // Countdown
+  if (state === 'countdown') {
+    overlay(0.43);
+    const pulse = Math.min(1, cdTick / 0.25);
+    const scale = 1 + 0.25 * pulse;
+    ctx.save();
+    ctx.translate(W/2, H/2);
+    ctx.scale(scale, scale);
+    text(Math.max(0, cdVal), 0, 55, 'bold 130px monospace', '#ffffff', 'center');
+    ctx.restore();
+  }
+  // Start flash
+  else if (state === 'start_flash') {
+    overlay(0.35);
+    text('Start!', W/2, H/2+50, 'bold 120px monospace', '#50ff82', 'center');
+  }
+  // Game over
+  else if (state === 'gameover') {
+    overlay(0.67);
+    text('GAME OVER',        W/2, H/2-60,  'bold 62px monospace', '#ffffff',  'center');
+    const wc = winnerText === 'YOU WIN!' ? '#50ff82' : '#ff5050';
+    text(winnerText,         W/2, H/2+0,   'bold 34px monospace', wc,         'center');
+    text('REPLAY  /  SPACE', W/2, H/2+50,  'bold 28px monospace', '#ffe632',  'center');
+    text('( tap anywhere to replay )', W/2, H/2+92,  '19px monospace', '#3c3c3c', 'center');
+  }
+
+  ctx.restore();
+}
+
+// ── Game loop ─────────────────────────────────────────────
+let last = 0;
+function loop(ts) {
+  const dt = Math.min((ts - last) / 1000, 0.05);
+  last = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// Start with first tick, then launch loop
+playTick();
+requestAnimationFrame(ts => { last = ts; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>
