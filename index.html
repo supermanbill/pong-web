@@ -117,6 +117,7 @@ let state = 'countdown';  // countdown | start_flash | playing | gameover
 let cdVal = 5, cdTick = 1.0, flashTimer = 0;
 let shake = 0, winnerText = '', resultPlayed = false;
 let particles = [];
+let wallFlashTop = 0, wallFlashBot = 0;  // 0-1 flash intensity
 
 const ai  = { x: 20,              y: H/2 - PH/2, score: 0 };
 const you = { x: W - 20 - PW,     y: H/2 - PH/2, score: 0 };
@@ -192,6 +193,7 @@ function doReplay() {
   particles = [];
   state = 'countdown'; cdVal = 5; cdTick = 1.0; flashTimer = 0;
   shake = 0; winnerText = ''; resultPlayed = false;
+  wallFlashTop = 0; wallFlashBot = 0;
   playTick();
 }
 
@@ -229,8 +231,10 @@ function update(dt) {
 
     // Ball
     ball.x += ball.vx; ball.y += ball.vy;
-    if (ball.y - BSIZE/2 <= 0)  { ball.y = BSIZE/2; ball.vy =  Math.abs(ball.vy); }
-    if (ball.y + BSIZE/2 >= H)  { ball.y = H - BSIZE/2; ball.vy = -Math.abs(ball.vy); }
+    if (ball.y - BSIZE/2 <= 0) { ball.y = BSIZE/2; ball.vy =  Math.abs(ball.vy); wallFlashTop = 1.0; }
+    if (ball.y + BSIZE/2 >= H) { ball.y = H-BSIZE/2; ball.vy = -Math.abs(ball.vy); wallFlashBot = 1.0; }
+    wallFlashTop = Math.max(0, wallFlashTop - dt * 4);
+    wallFlashBot = Math.max(0, wallFlashBot - dt * 4);
 
     // Collision helpers
     function ballRect() {
@@ -274,6 +278,33 @@ function update(dt) {
 }
 
 // ── Draw ──────────────────────────────────────────────────
+function drawWalls() {
+  const WH = 6;  // wall bar thickness
+  // Top wall
+  const tf = wallFlashTop;
+  ctx.fillStyle = tf > 0.05
+    ? `rgba(255,255,${~~(80+175*tf)},${0.5+tf*0.5})`
+    : 'rgba(200,200,200,0.35)';
+  ctx.fillRect(0, 0, W, WH);
+  if (tf > 0.05) {                        // glow halo
+    ctx.globalAlpha = tf * 0.3;
+    ctx.fillStyle = '#ffff88';
+    ctx.fillRect(0, 0, W, WH + 14);
+    ctx.globalAlpha = 1;
+  }
+  // Bottom wall
+  const bf = wallFlashBot;
+  ctx.fillStyle = bf > 0.05
+    ? `rgba(255,255,${~~(80+175*bf)},${0.5+bf*0.5})`
+    : 'rgba(200,200,200,0.35)';
+  ctx.fillRect(0, H - WH, W, WH);
+  if (bf > 0.05) {                        // glow halo
+    ctx.globalAlpha = bf * 0.3;
+    ctx.fillStyle = '#ffff88';
+    ctx.fillRect(0, H - WH - 14, W, WH + 14);
+    ctx.globalAlpha = 1;
+  }
+}
 function drawCenterLine() {
   ctx.fillStyle = '#3c3c3c';
   const dashH = 16, gap = 10;
@@ -354,6 +385,7 @@ function draw() {
 
   ctx.fillStyle = '#000'; ctx.fillRect(-10,-10,W+20,H+20);
   drawCenterLine();
+  drawWalls();
   drawPaddle(ai,  '#32dcdc');
   drawPaddle(you, '#ffe632');
   if (state === 'playing' || state === 'gameover') drawBall();
